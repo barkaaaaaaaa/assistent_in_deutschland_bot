@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 import httpx
-import re
 
 logging.basicConfig(level=logging.INFO)
 
@@ -60,10 +59,21 @@ async def claude_request(messages, system, model="claude-haiku-4-5-20251001", ma
         data = response.json()
         return data["content"][0]["text"].strip()
 
-async def is_germany_related(text: str) -> bool:
+async def is_germany_related(text: str, chat_id: int) -> bool:
+    """Проверка с учётом последних 3 сообщений из истории"""
+    history = chat_histories.get(chat_id, [])
+    last_3 = history[-3:] if len(history) >= 3 else history
+
+    # Формируем контекст для Haiku
+    context = ""
+    for msg in last_3:
+        role = "Участник" if msg["role"] == "user" else "Бот"
+        context += f"{role}: {msg['content']}\n"
+    context += f"Участник: {text}"
+
     result = await claude_request(
-        messages=[{"role": "user", "content": text}],
-        system="""Определи, связано ли это сообщение с жизнью в Германии, немецкими законами, визами, работой, жильём, языком, медициной, налогами, Jobcenter, или другими темами связанными с Германией.
+        messages=[{"role": "user", "content": context}],
+        system="""Определи, связано ли последнее сообщение участника с жизнью в Германии — с учётом контекста предыдущих сообщений. Это может быть ответ на вопрос бота, уточнение, или новый вопрос про Германию.
 Ответь только одним словом: ДА или НЕТ.""",
         model="claude-haiku-4-5-20251001",
         max_tokens=5
@@ -126,9 +136,9 @@ async def process_update(update: dict):
     user = message.get("from", {})
     user_name = user.get("first_name", "Участник")
 
-    # Шаг 1: дешёвая проверка через haiku
+    # Шаг 1: проверка с контекстом через Haiku
     try:
-        related = await is_germany_related(text)
+        related = await is_germany_related(text, chat_id)
     except Exception as e:
         logging.error(f"Ошибка проверки: {e}")
         return
@@ -137,7 +147,7 @@ async def process_update(update: dict):
         logging.info(f"Пропускаю нерелевантное: {text[:50]}")
         return
 
-    # Шаг 2: полный ответ через sonnet
+    # Шаг 2: полный ответ через Sonnet
     await send_typing(chat_id)
     try:
         reply = await ask_claude(chat_id, user_name, text)
