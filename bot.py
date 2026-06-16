@@ -1,16 +1,13 @@
 import os
+import asyncio
 import logging
-from telegram import Update
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
-import anthropic
+import httpx
 
-# Настройка логов
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 CLAUDE_API_KEY = os.environ["CLAUDE_API_KEY"]
-
-client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 SYSTEM_PROMPT = """Ты — дружелюбный помощник русскоязычного сообщества про жизнь в Германии. 
 Твоя задача — помогать участникам группы с любыми вопросами, связанными с Германией.
@@ -24,74 +21,113 @@ SYSTEM_PROMPT = """Ты — дружелюбный помощник русско
 - Налоги: налоговые классы, декларации, льготы
 - Образование: школы, университеты, признание дипломов
 - Банки, финансы, пенсионная система
-- Культура, традиции, жизнь в разных городах Германии
 - Транспорт: машина, права, общественный транспорт
 - Социальные пособия и господдержка
 
-Правила общения:
+Правила:
 - Всегда отвечай на русском языке
-- Будь дружелюбным, понятным и конкретным
+- Будь дружелюбным и конкретным
 - Если не знаешь точного ответа — честно скажи и посоветуй куда обратиться
-- Если вопрос совсем не связан с Германией — вежливо объясни, что ты специализируешься на теме Германии
-- Не давай юридических или медицинских гарантий, советуй консультироваться со специалистами в важных случаях
-- Отвечай кратко и по делу, без лишней воды"""
+- Если вопрос не про Германию — вежливо скажи что специализируешься только на этой теме"""
 
-# История сообщений для каждого чата (последние 10)
 chat_histories = {}
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    chat_id = update.message.chat_id
-    user_text = update.message.text
-    user_name = update.message.from_user.first_name or "Участник"
-
-    # Инициализируем историю чата
+async def ask_claude(chat_id: int, user_name: str, user_text: str) -> str:
     if chat_id not in chat_histories:
         chat_histories[chat_id] = []
 
-    # Добавляем сообщение пользователя в историю
     chat_histories[chat_id].append({
         "role": "user",
         "content": f"{user_name}: {user_text}"
     })
 
-    # Ограничиваем историю последними 10 сообщениями
-    if len(chat_histories[chat_id]) > 10:
-        chat_histories[chat_id] = chat_histories[chat_id][-10:]
+    if len(chat_histories[chat_id]) > 20:
+        chat_histories[chat_id] = chat_histories[chat_id][-20:]
 
-    # Показываем что бот печатает
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            messages=chat_histories[chat_id]
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1000,
+                "system": SYSTEM_PROMPT,
+                "messages": chat_histories[chat_id],
+            }
         )
+        data = response.json()
+        reply = data["content"][0]["text"]
 
-        reply = response.content[0].text
+    chat_histories[chat_id].append({
+        "role": "assistant",
+        "content": reply
+    })
 
-        # Добавляем ответ бота в историю
-        chat_histories[chat_id].append({
-            "role": "assistant",
-            "content": reply
+    return reply
+
+async def send_message(chat_id: int, text: str, reply_to: int = None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+
+async def send_typing(chat_id: int):
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f"{TELEGRAM_API}/sendChatAction", json={
+            "chat_id": chat_id, "action": "typing"
         })
 
-        await update.message.reply_text(reply)
+async def process_update(update: dict):
+    message = update.get("message")
+    if not message:
+        return
+    text = message.get("text", "")
+    if not text or text.startswith("/"):
+        return
 
+    chat_id = message["chat"]["id"]
+    message_id = message["message_id"]
+    user = message.get("from", {})
+    user_name = user.get("first_name", "Участник")
+
+    await send_typing(chat_id)
+    try:
+        reply = await ask_claude(chat_id, user_name, text)
+        await send_message(chat_id, reply, reply_to=message_id)
     except Exception as e:
         logging.error(f"Ошибка: {e}")
-        await update.message.reply_text("Извини, произошла ошибка. Попробуй ещё раз!")
+        await send_message(chat_id, "Извини, произошла ошибка. Попробуй ещё раз!")
 
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    # Отвечает на все текстовые сообщения (в группе и в личке)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Бот запущен!")
-    app.run_polling()
+async def main():
+    offset = None
+    logging.info("Бот запущен!")
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f"{TELEGRAM_API}/deleteWebhook")
+
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": ["message"]}
+            if offset:
+                params["offset"] = offset
+
+            async with httpx.AsyncClient(timeout=40) as client:
+                resp = await client.get(f"{TELEGRAM_API}/getUpdates", params=params)
+                data = resp.json()
+
+            if data.get("ok"):
+                for update in data.get("result", []):
+                    offset = update["update_id"] + 1
+                    asyncio.create_task(process_update(update))
+
+        except Exception as e:
+            logging.error(f"Ошибка polling: {e}")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
