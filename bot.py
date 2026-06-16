@@ -74,7 +74,7 @@ async def send_message(chat_id: int, text: str, reply_to: int = None):
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        await client.post(f"{TELEGRAM_API}/sendMessage", json={**payload, "parse_mode": "Markdown"})
 
 async def send_typing(chat_id: int):
     async with httpx.AsyncClient(timeout=10) as client:
