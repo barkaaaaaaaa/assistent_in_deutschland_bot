@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import httpx
+import re
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,17 +24,51 @@ SYSTEM_PROMPT = """Ты — дружелюбный помощник русско
 - Банки, финансы, пенсионная система
 - Транспорт: машина, права, общественный транспорт
 - Социальные пособия и господдержка
-
-Дополнительная информация:
-- Выплаты от джобцентра приходят в последний будний день месяца
+- Выплаты от Jobcenter приходят всегда в последний будний день месяца (пн-пт). Например, если 31-е это суббота или воскресенье — деньги придут в пятницу. На Sparkasse выплата может прийти на 1 день раньше чем на Deutsche Bank — это нормально.
 
 Правила:
 - Если вопрос был на русском языке - отвечай на русском, если вопрос был на украинском языке - отвечай на украинском, другие языки не используй
 - Будь дружелюбным и конкретным
 - Если не знаешь точного ответа — честно скажи и посоветуй куда обратиться
-- Если вопрос не связан с Германией — не отправляй вообще никакого ответа, даже пустого. Просто игнорируй сообщение полностью"""
+- Если вопрос не связан с Германией — не отвечай ничего
+
+Форматирование — используй HTML теги для красивого текста в Telegram:
+- Жирный: <b>текст</b>
+- Курсив: <i>текст</i>
+- Заголовки и важные слова выделяй жирным
+- Списки делай через цифры или дефис
+- Не используй звёздочки ** и символы markdown"""
 
 chat_histories = {}
+
+async def claude_request(messages, system, model="claude-haiku-4-5-20251001", max_tokens=10):
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": CLAUDE_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model,
+                "max_tokens": max_tokens,
+                "system": system,
+                "messages": messages,
+            }
+        )
+        data = response.json()
+        return data["content"][0]["text"].strip()
+
+async def is_germany_related(text: str) -> bool:
+    result = await claude_request(
+        messages=[{"role": "user", "content": text}],
+        system="""Определи, связано ли это сообщение с жизнью в Германии, немецкими законами, визами, работой, жильём, языком, медициной, налогами, Jobcenter, или другими темами связанными с Германией.
+Ответь только одним словом: ДА или НЕТ.""",
+        model="claude-haiku-4-5-20251001",
+        max_tokens=5
+    )
+    return "ДА" in result.upper()
 
 async def ask_claude(chat_id: int, user_name: str, user_text: str) -> str:
     if chat_id not in chat_histories:
@@ -47,23 +82,12 @@ async def ask_claude(chat_id: int, user_name: str, user_text: str) -> str:
     if len(chat_histories[chat_id]) > 20:
         chat_histories[chat_id] = chat_histories[chat_id][-20:]
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": CLAUDE_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 1000,
-                "system": SYSTEM_PROMPT,
-                "messages": chat_histories[chat_id],
-            }
-        )
-        data = response.json()
-        reply = data["content"][0]["text"]
+    reply = await claude_request(
+        messages=chat_histories[chat_id],
+        system=SYSTEM_PROMPT,
+        model="claude-sonnet-4-6",
+        max_tokens=1000
+    )
 
     chat_histories[chat_id].append({
         "role": "assistant",
@@ -73,11 +97,15 @@ async def ask_claude(chat_id: int, user_name: str, user_text: str) -> str:
     return reply
 
 async def send_message(chat_id: int, text: str, reply_to: int = None):
-    payload = {"chat_id": chat_id, "text": text}
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML"
+    }
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json={**payload, "parse_mode": "Markdown"})
+        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
 
 async def send_typing(chat_id: int):
     async with httpx.AsyncClient(timeout=10) as client:
@@ -98,12 +126,24 @@ async def process_update(update: dict):
     user = message.get("from", {})
     user_name = user.get("first_name", "Участник")
 
+    # Шаг 1: дешёвая проверка через haiku
+    try:
+        related = await is_germany_related(text)
+    except Exception as e:
+        logging.error(f"Ошибка проверки: {e}")
+        return
+
+    if not related:
+        logging.info(f"Пропускаю нерелевантное: {text[:50]}")
+        return
+
+    # Шаг 2: полный ответ через sonnet
     await send_typing(chat_id)
     try:
         reply = await ask_claude(chat_id, user_name, text)
         await send_message(chat_id, reply, reply_to=message_id)
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
+        logging.error(f"Ошибка ответа: {e}")
         await send_message(chat_id, "Извини, произошла ошибка. Попробуй ещё раз!")
 
 async def main():
