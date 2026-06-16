@@ -24,21 +24,24 @@ SYSTEM_PROMPT = """Ты — дружелюбный помощник русско
 - Транспорт: машина, права, общественный транспорт
 - Социальные пособия и господдержка
 - Выплаты от Jobcenter приходят всегда в последний будний день месяца (пн-пт). Например, если 31-е это суббота или воскресенье — деньги придут в пятницу. На Sparkasse выплата может прийти на 1 день раньше чем на Deutsche Bank — это нормально.
+- Aue-Bad Schlema — это город в Саксонии рядом с Цвикау (регион Эрцгебирге)
 
 Правила:
 - Если вопрос был на русском языке - отвечай на русском, если вопрос был на украинском языке - отвечай на украинском, другие языки не используй
 - Будь дружелюбным и конкретным
 - Если не знаешь точного ответа — честно скажи и посоветуй куда обратиться
 - Если вопрос не связан с Германией — не отвечай ничего
+- НИКОГДА не используй звёздочки * или ** для форматирования, только HTML теги <b> и <i>
 
-Форматирование — используй HTML теги для красивого текста в Telegram:
+Форматирование — используй HTML теги:
 - Жирный: <b>текст</b>
 - Курсив: <i>текст</i>
-- Заголовки и важные слова выделяй жирным
+- Заголовки и важные слова выделяй жирным через <b>
 - Списки делай через цифры или дефис
-- Не используй звёздочки ** и символы markdown"""
+- Никаких звёздочек и markdown"""
 
 chat_histories = {}
+bot_message_ids = set()  # ID сообщений самого бота
 
 async def claude_request(messages, system, model="claude-haiku-4-5-20251001", max_tokens=10):
     async with httpx.AsyncClient(timeout=30) as client:
@@ -60,11 +63,9 @@ async def claude_request(messages, system, model="claude-haiku-4-5-20251001", ma
         return data["content"][0]["text"].strip()
 
 async def is_germany_related(text: str, chat_id: int) -> bool:
-    """Проверка с учётом последних 3 сообщений из истории"""
     history = chat_histories.get(chat_id, [])
     last_3 = history[-3:] if len(history) >= 3 else history
 
-    # Формируем контекст для Haiku
     context = ""
     for msg in last_3:
         role = "Участник" if msg["role"] == "user" else "Бот"
@@ -115,7 +116,17 @@ async def send_message(chat_id: int, text: str, reply_to: int = None):
     if reply_to:
         payload["reply_to_message_id"] = reply_to
     async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        resp = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+        data = resp.json()
+        # Сохраняем ID отправленного сообщения бота
+        if data.get("ok"):
+            msg_id = data["result"]["message_id"]
+            bot_message_ids.add(msg_id)
+            # Чистим старые ID чтобы не росло бесконечно
+            if len(bot_message_ids) > 500:
+                oldest = sorted(bot_message_ids)[:100]
+                for mid in oldest:
+                    bot_message_ids.discard(mid)
 
 async def send_typing(chat_id: int):
     async with httpx.AsyncClient(timeout=10) as client:
@@ -136,18 +147,25 @@ async def process_update(update: dict):
     user = message.get("from", {})
     user_name = user.get("first_name", "Участник")
 
-    # Шаг 1: проверка с контекстом через Haiku
-    try:
-        related = await is_germany_related(text, chat_id)
-    except Exception as e:
-        logging.error(f"Ошибка проверки: {e}")
-        return
+    # Проверяем — это reply на сообщение бота?
+    reply_to = message.get("reply_to_message")
+    is_reply_to_bot = reply_to and reply_to.get("message_id") in bot_message_ids
 
-    if not related:
-        logging.info(f"Пропускаю нерелевантное: {text[:50]}")
-        return
+    if is_reply_to_bot:
+        # Если человек ответил боту — сразу отвечаем без проверки Haiku
+        logging.info(f"Reply на бота, отвечаю без проверки: {text[:50]}")
+    else:
+        # Обычное сообщение — проверяем через Haiku
+        try:
+            related = await is_germany_related(text, chat_id)
+        except Exception as e:
+            logging.error(f"Ошибка проверки: {e}")
+            return
 
-    # Шаг 2: полный ответ через Sonnet
+        if not related:
+            logging.info(f"Пропускаю нерелевантное: {text[:50]}")
+            return
+
     await send_typing(chat_id)
     try:
         reply = await ask_claude(chat_id, user_name, text)
